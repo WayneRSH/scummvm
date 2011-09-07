@@ -25,12 +25,8 @@
 // Allow use of stuff in <time.h>
 #define FORBIDDEN_SYMBOL_EXCEPTION_time_h
 
-// Disable system overrides to allow the use of system headers
-#define FORBIDDEN_SYMBOL_ALLOW_ALL
-
 #include "common/scummsys.h"
 #include "common/system.h"
-#include "common/translation.h"
 #include "sys/time.h"
 #include "time.h"
 
@@ -44,9 +40,6 @@ static bool gestureDown = false;
 
 // The timestamp when screen was pressed down.
 static int screenDownTime = 0;
-
-// The timestamp when a possible drag operation was triggered.
-static int dragStartTime = 0;
 
 // The index of the motion pointer.
 static int motionPtrIndex = -1;
@@ -74,6 +67,15 @@ static long queuedEventTime = 0;
 
 // An event to be processed after the next poll tick
 static Common::Event queuedInputEvent;
+
+// To prevent left clicking after right or middle click
+static bool blockLClick = false;
+
+// To prevent right clicking after middle click
+static bool blockRClick = false;
+
+// To prevent clicking when we want a special action
+static bool specialAction = false;
 
 /**
  * Initialize a new WebOSSdlEventSource.
@@ -106,8 +108,9 @@ bool WebOSSdlEventSource::pollEvent(Common::Event &event) {
 	// Move the queued event into the event if it's time
 	if (queuedInputEvent.type != (Common::EventType)0 && curTime >= queuedEventTime) {
 		event = queuedInputEvent;
+		if (event.type == Common::EVENT_LBUTTONDOWN)
+            processMouseEvent(event, curX, curY);
 		queuedInputEvent.type = (Common::EventType)0;
-		//printf("Running queued event\n");
 		return true;
 	}
 
@@ -132,7 +135,7 @@ void WebOSSdlEventSource::SDLModToOSystemKeyFlags(SDLMod mod,
 	if (mod & KMOD_CTRL)
 		event.kbd.flags |= Common::KBD_CTRL;
 
-		// Holding down the gesture area emulates the ALT key
+	// Holding down the gesture area emulates the ALT key
 	if (gestureDown)
 		event.kbd.flags |= Common::KBD_ALT;
 }
@@ -211,19 +214,40 @@ bool WebOSSdlEventSource::handleKeyUp(SDL_Event &ev, Common::Event &event) {
  * @return True if event was processed, false if not.
  */
 bool WebOSSdlEventSource::handleMouseButtonDown(SDL_Event &ev, Common::Event &event) {
+    // If no button was pressed
 	if (motionPtrIndex == -1) {
-		motionPtrIndex = ev.button.which;
+
+	    // We calculate the position of the first touch
+	    // to put our cursor on it
+	    int screenX = g_system->getWidth();
+        int screenY = g_system->getHeight();
+        curX = MIN(screenX, MAX(0, static_cast<int>(ev.motion.x)));
+        curY = MIN(screenY, MAX(0, static_cast<int>(ev.motion.y)));
+
 		dragDiffX = 0;
 		dragDiffY = 0;
 		screenDownTime = getMillis();
+		blockLClick = false;
+		blockRClick = false;
+		specialAction = false;
 
-		// Start dragging when pressing the screen shortly after a tap.
-		if (getMillis() - dragStartTime < 250) {
-			dragging = true;
-			event.type = Common::EVENT_LBUTTONDOWN;
-			processMouseEvent(event, curX, curY);
-		}
+		long curTime = getMillis();
+
+        // Queued event, to hold left click if we don't move
+        queuedInputEvent.type = Common::EVENT_LBUTTONDOWN;
+        queuedEventTime = curTime + 500;
 	}
+	// If we push another button while the first one is pressed,
+	// we stop the queued event if it didn't trigger yet
+	else {
+	    if (queuedInputEvent.type == Common::EVENT_LBUTTONDOWN) {
+            queuedInputEvent.type = (Common::EventType)0;
+        }
+	}
+
+	// We store the index of the pressed button (for multi-touch)
+    motionPtrIndex = ev.button.which;
+
 	return true;
 }
 
@@ -235,93 +259,96 @@ bool WebOSSdlEventSource::handleMouseButtonDown(SDL_Event &ev, Common::Event &ev
  * @return True if event was processed, false if not.
  */
 bool WebOSSdlEventSource::handleMouseButtonUp(SDL_Event &ev, Common::Event &event) {
-	if (motionPtrIndex == ev.button.which) {
-		motionPtrIndex = -1;
+    // We stop the queued event that was supposed to left click if it hasn't happen yet
+    if (queuedInputEvent.type == Common::EVENT_LBUTTONDOWN) {
+        queuedInputEvent.type = (Common::EventType)0;
+    }
 
-		int screenX = g_system->getWidth();
-		int screenY = g_system->getHeight();
-		long curTime = getMillis();
-		
-		// 90% of the screen height for menu dialog/keyboard
-		if (ABS(dragDiffY) >= ABS(screenY*0.9)) {
-			if (dragDiffY <= 0) {
-				int gblPDKVersion = PDL_GetPDKVersion();
-				// check for correct PDK Version
-				if (gblPDKVersion >= 300) {
-					PDL_SetKeyboardState(PDL_TRUE);
-					return true;
-				}
-			} else {
-				if (g_engine && !g_engine->isPaused()) {
-					g_engine->openMainMenuDialog();
-					return true;
-				}
-			}
-		}
-
-		// A swipe left triggers Escape
-		if (ABS(dragDiffX) >= ABS(screenX*0.9) && dragDiffX <= 0) {
-			event.type = Common::EVENT_KEYDOWN;
-			queuedInputEvent.type = Common::EVENT_KEYUP;
-			event.kbd.flags = queuedInputEvent.kbd.flags = 0;
-			event.kbd.keycode = queuedInputEvent.kbd.keycode = Common::KEYCODE_ESCAPE;
-			event.kbd.ascii = queuedInputEvent.kbd.ascii = Common::ASCII_ESCAPE;
-			queuedEventTime = curTime + queuedInputEventDelay;
-
-			/*
-			const char *dialogMsg;
-			dialogMsg = _("Escaped!");
-			GUI::TimedMessageDialog dialog(dialogMsg, 1000);
-			dialog.runModal();
-			*/
-			//printf("Escaped!\n");
-		}
+    // To handle the first button pressed
+    if (ev.button.which == 0) {
+        // No more button pressed
+        motionPtrIndex = -1;
 
 		// When drag mode was active then simply send a mouse up event
-		if (dragging)
-		{
+		// only if we don't display the menu, or it could click on it
+		if (dragging && !specialAction) {
 			event.type = Common::EVENT_LBUTTONUP;
 			processMouseEvent(event, curX, curY);
 			dragging = false;
 			return true;
 		}
 
-		// When mouse was moved 5 pixels or less then emulate a mouse button
-		// click.
-		if (ABS(dragDiffX) < 6 && ABS(dragDiffY) < 6)
-		{
-			int duration = getMillis() - screenDownTime;
-
-			// When screen was pressed for less than 500ms then emulate a
-			// left mouse click.
-			if (duration < 500) {
-				event.type = Common::EVENT_LBUTTONUP;
-				processMouseEvent(event, curX, curY);
-				g_system->getEventManager()->pushEvent(event);
-				event.type = Common::EVENT_LBUTTONDOWN;
-				dragStartTime = getMillis();
-			}
-
-			// When screen was pressed for less than 1000ms then emulate a
-			// right mouse click.
-			else if (duration < 1000) {
-				event.type = Common::EVENT_RBUTTONUP;
-				processMouseEvent(event, curX, curY);
-				g_system->getEventManager()->pushEvent(event);
-				event.type = Common::EVENT_RBUTTONDOWN;
-			}
-
-			// When screen was pressed for more than 1000ms then emulate a
-			// middle mouse click.
-			else {
-				event.type = Common::EVENT_MBUTTONUP;
-				processMouseEvent(event, curX, curY);
-				g_system->getEventManager()->pushEvent(event);
-				event.type = Common::EVENT_MBUTTONDOWN;
-			}
-
-		}
+		// When mouse was moved 5 pixels or less then emulate
+		// a mouse button click
+		if (ABS(dragDiffX) < 6 && ABS(dragDiffY) < 6 && !blockLClick) {
+            event.type = Common::EVENT_LBUTTONUP;
+            processMouseEvent(event, curX, curY);
+            g_system->getEventManager()->pushEvent(event);
+            event.type = Common::EVENT_LBUTTONDOWN;
+        }
 	}
+
+	// If the second button is released
+	if (ev.button.which == 1) {
+	    int screenX = g_system->getWidth();
+        int screenY = g_system->getHeight();
+
+	    // 60% of the screen height for menu dialog/keyboard
+        if (ABS(dragDiffY) >= ABS(screenY*0.6)) {
+            specialAction = true;
+            if (dragDiffY <= 0) {
+                int gblPDKVersion = PDL_GetPDKVersion();
+                // check for correct PDK Version
+                if (gblPDKVersion >= 300) {
+                    PDL_SetKeyboardState(PDL_TRUE);
+                    return true;
+                }
+            } else {
+                if (g_engine && !g_engine->isPaused()) {
+                    g_engine->openMainMenuDialog();
+                    return true;
+                }
+            }
+        }
+
+        // 60% of the screen width for escape key (left or right)
+		if (ABS(dragDiffX) >= ABS(screenX*0.6)) {
+		    specialAction = true;
+		    long curTime = getMillis();
+
+			event.type = Common::EVENT_KEYDOWN;
+			queuedInputEvent.type = Common::EVENT_KEYUP;
+			event.kbd.flags = queuedInputEvent.kbd.flags = 0;
+			event.kbd.keycode = queuedInputEvent.kbd.keycode = Common::KEYCODE_ESCAPE;
+			event.kbd.ascii = queuedInputEvent.kbd.ascii = Common::ASCII_ESCAPE;
+			queuedEventTime = curTime + queuedInputEventDelay;
+			return true;
+		}
+
+		// When we tap with the second finger (without moving the first finger
+        // more than 6 pixels), we emulate a right click
+		if (ABS(dragDiffX) < 6 && ABS(dragDiffY) < 6 && !blockRClick) {
+            event.type = Common::EVENT_RBUTTONUP;
+            processMouseEvent(event, curX, curY);
+            g_system->getEventManager()->pushEvent(event);
+            event.type = Common::EVENT_RBUTTONDOWN;
+            blockLClick = true;
+        }
+	}
+
+	// If the third button is released
+	if (ev.button.which == 2) {
+        // When we tap with the third finger (without moving the first finger
+        // more than 6 pixels), we emulate a middle click
+		if (ABS(dragDiffX) < 6 && ABS(dragDiffY) < 6) {
+            event.type = Common::EVENT_MBUTTONUP;
+            processMouseEvent(event, curX, curY);
+            g_system->getEventManager()->pushEvent(event);
+            event.type = Common::EVENT_MBUTTONDOWN;
+            blockLClick = blockRClick = true;
+        }
+	}
+
 	return true;
 }
 
@@ -333,16 +360,25 @@ bool WebOSSdlEventSource::handleMouseButtonUp(SDL_Event &ev, Common::Event &even
  * @return True if event was processed, false if not.
  */
 bool WebOSSdlEventSource::handleMouseMotion(SDL_Event &ev, Common::Event &event) {
-	if (ev.motion.which == motionPtrIndex) {
-		int screenX = g_system->getWidth();
-		int screenY = g_system->getHeight();
-		curX = MIN(screenX, MAX(0, curX + ev.motion.xrel));
-		curY = MIN(screenY, MAX(0, curY + ev.motion.yrel));
-		dragDiffX += ev.motion.xrel;
-		dragDiffY += ev.motion.yrel;
+	if (ev.motion.which == 0) {
+        int screenX = g_system->getWidth();
+        int screenY = g_system->getHeight();
+		curX = MIN(screenX, MAX(0, static_cast<int>(ev.motion.x)));
+		curY = MIN(screenY, MAX(0, static_cast<int>(ev.motion.y)));
+        dragDiffX += ev.motion.xrel;
+        dragDiffY += ev.motion.yrel;
 		event.type = Common::EVENT_MOUSEMOVE;
 		processMouseEvent(event, curX, curY);
 	}
+	// If we move more than 5 pixels, we're dragging
+    // so, we stop the queued event that was going to
+    // left click
+    if (motionPtrIndex != -1 && (ABS(dragDiffX) > 5 || ABS(dragDiffY) > 5) && !dragging) {
+        if (queuedInputEvent.type == Common::EVENT_LBUTTONDOWN) {
+            queuedInputEvent.type = (Common::EventType)0;
+        }
+        dragging = true;
+    }
 	return true;
 }
 
